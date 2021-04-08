@@ -1,3 +1,7 @@
+[TOC]
+
+
+
 ## 1.Linux编程开发基础
 
 ### 1.1静态库的制作和使用
@@ -6074,3 +6078,1824 @@ TCP 可以看成是一种字节流，它会处理 IP 层或以下的层的丢包
 ```
 
 多进程实现并发通信
+
+**server.c**
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <signal.h>
+#include <wait.h>
+#include <errno.h>
+
+void recyleChild(int num){
+    while(1){
+        int re = waitpid(-1,NULL,WNOHANG);
+        if(re == -1){
+            // 所有子进程都回收结束
+            break;
+        }else if(re == 0){
+            break;
+            // 没有需要回收的子进程
+        }else if(re > 0){
+            // 被回收了
+            printf("子进程 %d 被回收了\n",re);
+        }
+    }
+
+}
+int main(){
+    // 注册信号捕捉
+    struct sigaction act;
+    act.sa_flags = 0;
+    sigemptyset(&act.sa_mask);
+    act.sa_handler = recyleChild;
+    sigaction(SIGCHLD,&act,NULL);
+
+    // 创建socket
+    // AF表示地址族
+    // PF表示协议组
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    if(lfd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 绑定IP和端口
+    struct sockaddr_in  clientaddr;
+    clientaddr.sin_family = AF_INET;
+    inet_pton(AF_INET,"192.168.190.143",&clientaddr.sin_addr.s_addr);
+    clientaddr.sin_port = htons(9999);
+    int re = bind(lfd,(struct sockaddr *)&clientaddr,sizeof(clientaddr));
+    if(re == -1){
+        perror("bind");
+        exit(0);
+    }
+
+    // 监听
+    re = listen(lfd,5);
+    if(re == -1){
+        perror("listen");
+        exit(0);
+    }
+
+    // 不断循环等待客户端连接
+    while (1)
+    {
+        // 接受连接
+        struct sockaddr_in cliaddr;
+        socklen_t len = sizeof(cliaddr);
+        int cfd = accept(lfd,(struct sockaddr *)&cliaddr,&len);
+        // 如果调用出错就会产生一个errno,然后结束这个进程运行,所以后边的客户端就不能再加入
+        if(cfd == -1){
+            if(errno == EINTR){
+                continue;
+            }
+            perror("accept");
+            exit(0);
+        }
+
+        // 每一个连接进来创建子进程和客户端进行通信
+        pid_t pid = fork();
+        if(pid == 0){
+            // 子进程
+            // 获取客户端信息
+            char cliIP[16] = {};
+            inet_ntop(AF_INET,&cliaddr.sin_addr.s_addr,cliIP,(socklen_t)sizeof(cliIP));
+            unsigned short cliPort = ntohs(cliaddr.sin_port);
+            printf("recv client IP : %s, PORT : %d \n",cliIP,cliPort);
+
+            // 接受客户端发来的数据
+            char buf[1024] = {};
+            while(1){
+                int num = read(cfd,buf,sizeof(buf));
+                if(num == -1){
+                    perror("read");
+                    exit(0);
+                }else if(num > 0){
+                    printf("rev client : %s \n",buf);
+                }else if(num == 0){
+                    printf("client closed ...\n");
+                    break;
+                }
+
+                write(cfd,buf,strlen(buf)+1);
+            }
+            close(cfd);
+            pthread_exit(NULL);
+
+        }else if(pid > 0){
+            // 父进程
+
+        }else if(pid == -1){
+            perror("fork");
+            exit(0);
+        }
+
+    }
+
+    close(lfd);
+    return 0;
+}
+```
+
+**client.c**
+
+```c
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main(){
+    // 1.创建套接字
+    int fd = socket(AF_INET,SOCK_STREAM,0);
+    if(fd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 2.连接服务器
+    struct sockaddr_in serveraddr;
+    serveraddr.sin_family = AF_INET;
+    inet_pton(AF_INET,"192.168.190.143",&serveraddr.sin_addr.s_addr);
+    serveraddr.sin_port = htons(9999);
+
+    int re = connect(fd,(struct sockaddr *)&serveraddr,sizeof(serveraddr));
+    if(re == -1){
+       perror("connect");
+       exit(0); 
+    }
+
+    // 3. 通信
+    int i = 0;
+    char recvBuf[1024] = {0};
+    while(1) {
+        // 给服务端发送数据
+        sprintf(recvBuf,"data : %d\n",i++);
+        write(fd, recvBuf , strlen(recvBuf));
+        
+        int len = read(fd, recvBuf, sizeof(recvBuf));
+        if(len == -1) {
+            perror("read");
+            exit(-1);
+        } else if(len > 0) {
+            printf("recv server : %s\n", recvBuf);
+        } else if(len == 0) {
+            // 表示服务器端断开连接
+            printf("server closed...");
+            break;
+        }
+        sleep(1);
+        
+
+    }
+    // 关闭连接
+    close(fd);
+    return 0;
+}
+```
+
+### 4.17 TCP多线程实现并发服务器
+
+**client_thread.c**
+
+```c
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main(){
+    // 1.创建套接字
+    int fd = socket(AF_INET,SOCK_STREAM,0);
+    if(fd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 2.连接服务器
+    struct sockaddr_in serveraddr;
+    serveraddr.sin_family = AF_INET;
+    inet_pton(AF_INET,"192.168.190.143",&serveraddr.sin_addr.s_addr);
+    serveraddr.sin_port = htons(9999);
+
+    int re = connect(fd,(struct sockaddr *)&serveraddr,sizeof(serveraddr));
+    if(re == -1){
+       perror("connect");
+       exit(0); 
+    }
+
+    // 3. 通信
+    int i = 0;
+    char recvBuf[1024] = {0};
+    while(1) {
+        // 给服务端发送数据
+        sprintf(recvBuf,"data : %d\n",i++);
+        write(fd, recvBuf , strlen(recvBuf));
+        
+        int len = read(fd, recvBuf, sizeof(recvBuf));
+        if(len == -1) {
+            perror("read");
+            exit(-1);
+        } else if(len > 0) {
+            printf("recv server : %s\n", recvBuf);
+        } else if(len == 0) {
+            // 表示服务器端断开连接
+            printf("server closed...");
+            break;
+        }
+        sleep(1);
+        
+
+    }
+    // 关闭连接
+    close(fd);
+    return 0;
+}
+```
+
+**server_thread.c**
+
+```c
+#include <pthread.h>
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+struct sockInfo{
+    int fd;
+    struct sockaddr_in addr;
+    pthread_t tid;
+};
+
+struct sockInfo sockinfos[128];
+
+void * MyFun(void * arg){
+    // 进行子线程和客户端通信  cfd  客户端信息  线程号
+    char cliIP[16] = {};
+    struct sockInfo * pinfo = (struct sockInfo *)arg;
+    inet_ntop(AF_INET,&pinfo->addr.sin_addr.s_addr,cliIP,(socklen_t)sizeof(cliIP));
+    unsigned short cliPort = ntohs(pinfo->addr.sin_port);
+    printf("recv client IP : %s, PORT : %d \n",cliIP,cliPort);
+
+    // 接受客户端发来的数据
+    char buf[1024] = {};
+    while(1){
+        int num = read(pinfo->fd,buf,sizeof(buf));
+        if(num == -1){
+            perror("read");
+            exit(0);
+        }else if(num > 0){
+            printf("rev client : %s \n",buf);
+        }else if(num == 0){
+            printf("client closed ...\n");
+            break;
+        }
+
+        write(pinfo->fd,buf,strlen(buf)+1);
+    }
+    close(pinfo->fd);
+    pthread_exit(NULL);
+    return NULL;
+}
+
+int main(){
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    if(lfd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 绑定IP和端口
+    struct sockaddr_in  clientaddr;
+    clientaddr.sin_family = AF_INET;
+    inet_pton(AF_INET,"192.168.190.143",&clientaddr.sin_addr.s_addr);
+    clientaddr.sin_port = htons(9999);
+    int re = bind(lfd,(struct sockaddr *)&clientaddr,sizeof(clientaddr));
+    if(re == -1){
+        perror("bind");
+        exit(0);
+    }
+
+    // 监听
+    re = listen(lfd,5);
+    if(re == -1){
+        perror("listen");
+        exit(0);
+    }
+    // 初始化数据
+    int max = sizeof(sockinfos)/sizeof(sockinfos[0]);
+    for(int i = 0; i < max; i ++){
+        bzero(&sockinfos[i],sizeof(sockinfos[i]));
+        sockinfos[i].fd = -1;
+        // 设置文件描述符不可用
+
+    }
+    //循环的等待客户端的连接，一但有子进程连接进来就创建子线程
+    while(1){
+        // 接受连接
+        struct sockaddr_in cliaddr;
+        socklen_t len = sizeof(cliaddr);
+        int cfd = accept(lfd,(struct sockaddr *)&cliaddr,&len);
+
+        struct sockInfo *pinfo;
+        for(int i = 0; i < max; i++){
+            // 从数组中找到一个可用的sockInfo元素
+            if(sockinfos[i].fd == -1){
+                pinfo = &sockinfos[i];
+                break;
+            }
+            if(i == max-1){
+                sleep(1);
+                i--;
+            }
+        }
+
+        pinfo->fd = cfd;
+
+        // memcpy(&pinfo->addr,&cliaddr,sizeof(cliaddr));
+        pinfo->addr.sin_addr.s_addr = cliaddr.sin_addr.s_addr;
+        pinfo->addr.sin_family = cliaddr.sin_family;
+        pinfo->addr.sin_port = cliaddr.sin_port;
+        
+
+        // 创建子线程
+        pthread_create(&pinfo->tid,NULL,MyFun,pinfo);
+
+        // pthread_join(NULL);
+        // 阻塞的
+
+        pthread_detach(pinfo->tid);
+    }
+    
+    return 0;
+
+}
+```
+
+### 4.18 TCP状态转换
+
+![image-20210406105052203](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210406105052203.png)
+
+四次回收的ACK和FIN分开发送，是因为断开连接时单方面的，肯另外一端还要发送数据中间还要间隔一段时间，所以需要分开进行发送。
+
+![image-20210406105812591](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210406105812591.png)
+
+**客户端进入TIME_WAIT状态后经过两倍的报文寿命以后结束**
+
+- 2MSL（Maximum Segment Lifetime）
+
+  主动断开连接的一方, 最后进入一个 TIME_WAIT状态, 这个状态会持续: 2msl
+  - msl: 官方建议: 2分钟, 实际是30s
+
+  > 当 TCP 连接主动关闭方接收到被动关闭方发送的 FIN 和最终的 ACK 后，连接的主动关闭方必须处于TIME_WAIT 状态并持续 2MSL 时间。 这样就能够让 TCP 连接的主动关闭方在它发送的ACK 丢失的情况下重新发送最终的ACK。 主动关闭方重新发送的最终 ACK 并不是因为被动关闭方重传了ACK（它们并不消耗序列号，被动关闭方也不会重传），而是因为被动关闭方重传了它的 FIN。事实上，被动关闭方总是重传 FIN 直到它收到一个最终的 ACK。
+
+- 半关闭
+
+  > 当 TCP 链接中 A 向 B 发送 FIN 请求关闭，另一端 B 回应 ACK 之后（A 端进入 FIN_WAIT_2 状态），并没有立即发送 FIN 给 A，A 方处于半连接状态（半开关），此时 A 可以接收 B 发送的数据，但是 A 已经不能再向 B 发送数据。
+
+从程序的角度，可以使用 API 来控制实现半连接状态：
+
+```c
+#include <sys/socket.h> 
+int shutdown(int sockfd, int how); 
+sockfd: 需要关闭的socket的描述符 
+how: 允许为shutdown操作选择以下几种方式:
+	SHUT_RD(0)：关闭sockfd上的读功能，此选项将不允许sockfd进行读操作。
+        		该套接字不再接收数据，任何当前在套接字接受缓冲区的数据将被无声的丢弃掉。
+	SHUT_WR(1): 关闭sockfd的写功能，此选项将不允许sockfd进行写操作。进程不能在对此套接字发
+出写操作。 
+    SHUT_RDWR(2):关闭sockfd的读写功能。相当于调用shutdown两次：首先是以SHUT_RD,然后以
+SHUT_WR。
+```
+
+使用 close 中止一个连接，但它只是减少描述符的引用计数，并不直接关闭连接，只有当描述符的引用计数为0时才关闭连接。shutdown不考虑描述符的引用计数，直接关闭描述符。也可选择中止一个方向的连接，只中止读或只中止写。
+
+注意: 
+
+1. 如果有多个进程共享一个套接字，close 每被调用一次，计数减 1 ，直到计数为 0 时，也就是所用进程都调用了close，套接字将被释放。
+
+2. 在多进程中如果一个进程调用了 shutdown(sfd, SHUT_RDWR) 后，其它的进程将无法进行通信。但如果一个进程 close(sfd) 将不会影响到其它进程。
+
+### 4.19 端口复用
+
+> 端口复用最常用的用途是: 
+>
+> ​	防止服务器重启时之前绑定的端口还未释放
+> ​	程序突然退出而系统没有释放端口
+
+```c
+#include <sys/types.h> 
+#include <sys/socket.h> 
+// 设置套接字的属性（不仅仅能设置端口复用） 
+int setsockopt(int sockfd, int level, int optname, const void *optval, socklen_t optlen); 
+	参数： 
+        - sockfd : 要操作的文件描述符 
+        - level : 级别 - SOL_SOCKET (端口复用的级别) 
+        - optname : 选项的名称 
+            - SO_REUSEADDR 
+            - SO_REUSEPORT
+		- optval : 端口复用的值（整形） 
+            - 1 : 可以复用 
+            - 0 : 不可以复用
+		- optlen : optval参数的大小
+            
+端口复用，设置的时机是在服务器绑定端口之前。 
+            setsockopt();
+			bind();
+```
+
+常看网络相关信息的命令 
+
+netstat
+	参数：
+
+​	-a 所有的socket 
+
+​	-p 显示正在使用socket的程序的名称
+
+​	-n 直接使用IP地址，而不通过域名服务器
+
+TCP_server.c
+
+```c
+#include <stdio.h>
+#include <ctype.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+
+int main(int argc, char *argv[]) {
+
+    // 创建socket
+    int lfd = socket(PF_INET, SOCK_STREAM, 0);
+
+    if(lfd == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_in saddr;
+    saddr.sin_family = AF_INET;
+    saddr.sin_addr.s_addr = INADDR_ANY;
+    saddr.sin_port = htons(9999);
+    
+    //int optval = 1;
+    //setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
+    int optval = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEPORT, &optval, sizeof(optval));
+
+    // 绑定
+    int ret = bind(lfd, (struct sockaddr *)&saddr, sizeof(saddr));
+    if(ret == -1) {
+        perror("bind");
+        return -1;
+    }
+
+    // 监听
+    ret = listen(lfd, 8);
+    if(ret == -1) {
+        perror("listen");
+        return -1;
+    }
+
+    // 接收客户端连接
+    struct sockaddr_in cliaddr;
+    socklen_t len = sizeof(cliaddr);
+    int cfd = accept(lfd, (struct sockaddr *)&cliaddr, &len);
+    if(cfd == -1) {
+        perror("accpet");
+        return -1;
+    }
+
+    // 获取客户端信息
+    char cliIp[16];
+    inet_ntop(AF_INET, &cliaddr.sin_addr.s_addr, cliIp, sizeof(cliIp));
+    unsigned short cliPort = ntohs(cliaddr.sin_port);
+
+    // 输出客户端的信息
+    printf("client's ip is %s, and port is %d\n", cliIp, cliPort );
+
+    // 接收客户端发来的数据
+    char recvBuf[1024] = {0};
+    while(1) {
+        int len = recv(cfd, recvBuf, sizeof(recvBuf), 0);
+        if(len == -1) {
+            perror("recv");
+            return -1;
+        } else if(len == 0) {
+            printf("客户端已经断开连接...\n");
+            break;
+        } else if(len > 0) {
+            printf("read buf = %s\n", recvBuf);
+        }
+
+        // 小写转大写
+        for(int i = 0; i < len; ++i) {
+            recvBuf[i] = toupper(recvBuf[i]);
+        }
+
+        printf("after buf = %s\n", recvBuf);
+
+        // 大写字符串发给客户端
+        ret = send(cfd, recvBuf, strlen(recvBuf) + 1, 0);
+        if(ret == -1) {
+            perror("send");
+            return -1;
+        }
+    }
+    
+    close(cfd);
+    close(lfd);
+
+    return 0;
+}
+
+```
+
+TCP_client.c
+
+```c
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main() {
+
+    // 创建socket
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if(fd == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_in seraddr;
+    inet_pton(AF_INET, "127.0.0.1", &seraddr.sin_addr.s_addr);
+    seraddr.sin_family = AF_INET;
+    seraddr.sin_port = htons(9999);
+
+    // 连接服务器
+    int ret = connect(fd, (struct sockaddr *)&seraddr, sizeof(seraddr));
+
+    if(ret == -1){
+        perror("connect");
+        return -1;
+    }
+
+    while(1) {
+        char sendBuf[1024] = {0};
+        fgets(sendBuf, sizeof(sendBuf), stdin);
+
+        write(fd, sendBuf, strlen(sendBuf) + 1);
+
+        // 接收
+        int len = read(fd, sendBuf, sizeof(sendBuf));
+        if(len == -1) {
+            perror("read");
+            return -1;
+        }else if(len > 0) {
+            printf("read buf = %s\n", sendBuf);
+        } else {
+            printf("服务器已经断开连接...\n");
+            break;
+        }
+    }
+
+    close(fd);
+
+    return 0;
+}
+
+```
+
+### 4.20 I/O多路复用（I/O多路转接）
+
+I/O 多路复用使得程序能同时监听多个文件描述符，能够提高程序的性能，Linux 下实现 I/O 多路复用的系统调用主要有 select、poll 和 epoll。
+
+**常用I/O模型**
+
+![image-20210407093349276](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407093349276.png)
+
+![image-20210407093946828](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407093946828.png)
+
+![image-20210407094012747](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407094012747.png)
+
+![image-20210407094229399](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407094229399.png)
+
+![image-20210407094528117](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407094528117.png)
+
+![image-20210407094836019](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407094836019.png)
+
+#### 4.20.1 select
+
+> 主旨思想： 
+>
+> 1. 首先要构造一个关于文件描述符的列表，将要监听的文件描述符添加到该列表中。 
+>
+> 2. 调用一个系统函数，监听该列表中的文件描述符，直到这些描述符中的一个或者多个进行I/O 操作时，该函数才返回。
+>    1. a.这个函数是阻塞 
+>    2. b.函数对文件描述符的检测的操作是由内核完成的
+>
+> 3. 在返回时，它会告诉进程有多少（哪些）描述符要进行I/O操作。
+
+```c
+// sizeof(fd_set) = 128 1024
+#include <sys/time.h> 
+#include <sys/types.h> 
+#include <unistd.h> 
+#include <sys/select.h> 
+int select(int nfds, fd_set *readfds, 
+           fd_set *writefds, fd_set *exceptfds, struct timeval *timeout);
+	- 参数：
+		- nfds : 委托内核检测的最大文件描述符的值 + 1 
+        - readfds : 要检测的文件描述符的读的集合，委托内核检测哪些文件描述符的读的属性 
+        	- 一般检测读操作 
+            - 对应的是对方发送过来的数据，因为读是被动的接收数据，检测的就是读缓冲区 
+        	- 是一个传入传出参数
+		- writefds : 要检测的文件描述符的写的集合，委托内核检测哪些文件描述符的写的属性 
+            - 委托内核检测写缓冲区是不是还可以写数据（不满的就可以写）
+		- exceptfds : 检测发生异常的文件描述符的集合 
+        - timeout : 设置的超时时间 
+        struct timeval { 
+            long tv_sec ;	/* seconds */
+            long tv_usec;	/* microseconds */
+        }; 
+		- NULL : 永久阻塞，直到检测到了文件描述符有变化 
+        - tv_sec = 0 tv_usec = 0， 不阻塞 
+        - tv_sec > 0 tv_usec > 0， 阻塞对应的时间
+ 	- 返回值 : 
+		- -1 : 失败 
+    	- >0(n) : 检测的集合中有n个文件描述符发生了变化
+        
+// 将参数文件描述符fd对应的标志位设置为0 
+void FD_CLR(int fd, fd_set *set); 
+// 判断fd对应的标志位是0还是1， 返回值 ： fd对应的标志位的值，0，返回0， 1，返回1 
+int FD_ISSET(int fd, fd_set *set); 
+// 将参数文件描述符fd 对应的标志位，设置为1
+void FD_SET(int fd, fd_set *set);
+// fd_set一共有1024 bit, 全部初始化为0 
+void FD_ZERO(fd_set *set);
+```
+
+![image-20210407192553698](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407192553698.png)
+
+![image-20210407203831149](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407203831149.png)
+
+![image-20210407203858127](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407203858127.png)
+
+**client.c**
+
+```c
+#include <stdio.h>
+#include <arpa/inet.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+
+int main() {
+
+    // 创建socket
+    int fd = socket(PF_INET, SOCK_STREAM, 0);
+    if(fd == -1) {
+        perror("socket");
+        return -1;
+    }
+
+    struct sockaddr_in seraddr;
+    inet_pton(AF_INET, "127.0.0.1", &seraddr.sin_addr.s_addr);
+    seraddr.sin_family = AF_INET;
+    seraddr.sin_port = htons(9999);
+
+    // 连接服务器
+    int ret = connect(fd, (struct sockaddr *)&seraddr, sizeof(seraddr));
+
+    if(ret == -1){
+        perror("connect");
+        return -1;
+    }
+
+    int num = 0;
+    while(1) {
+        char sendBuf[1024] = {0};
+        // fgets(sendBuf, sizeof(sendBuf), stdin);
+
+        sprintf(sendBuf,"send data %d",num++);
+        
+        write(fd, sendBuf, strlen(sendBuf) + 1);
+
+        // 接收
+        int len = read(fd, sendBuf, sizeof(sendBuf));
+        if(len == -1) {
+            perror("read");
+            return -1;
+        }else if(len > 0) {
+            printf("read buf = %s\n", sendBuf);
+        } else {
+            printf("服务器已经断开连接...\n");
+            break;
+        }
+        sleep(1);
+    }
+
+    close(fd);
+
+    return 0;
+}
+
+```
+
+**server.c**
+
+```c
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+
+int main(){
+
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    struct sockaddr_in saddr;
+    saddr.sin_addr.s_addr =  INADDR_ANY;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+
+    // 绑定
+    int re = bind(lfd,(struct sockaddr *)&saddr,sizeof(saddr));
+
+    // 监听
+    listen(lfd,8);
+
+    // 创建一个fd_set的一个集合，用来存放需要检测的文件描述符
+    fd_set rdset,temp;
+    FD_ZERO(&rdset);
+    FD_SET(lfd,&rdset);
+    int maxfd = lfd;
+
+    while(1){
+        temp = rdset;
+        int ret = select(maxfd+1,&temp,NULL,NULL,NULL);
+        if(ret == -1){
+            perror("select");
+            exit(0);
+        }else if(ret == 0){
+            continue;
+        }else if(ret > 0){
+            // 说明对应文件描述符的缓冲区发生了改变。
+            if(FD_ISSET(lfd,&temp)){
+                // 表示有新的客户端连接进来
+                struct sockaddr_in clientaddr;
+                int len = sizeof(clientaddr);
+                int cfd = accept(lfd,(struct sockaddr *)&clientaddr,&len);
+
+                // 将新的文件描述符加入到集合中
+                FD_SET(cfd,&rdset);
+                
+                // 更新最大的文件描述符
+                maxfd = maxfd > cfd ? maxfd : cfd;
+            }
+            for(int i = lfd + 1;i <= maxfd; i++){
+                if(FD_ISSET(i,&temp)){
+                    // 说明文件描述符对应的客户端发来了数据
+                    char buf[1024] = {0};
+                    int len = read(i,buf,sizeof(buf));
+                    if(len == -1){
+                        perror("read");
+                        exit(0);
+                    }else if(len == 0){
+                        printf("client closed ....\n");
+                        close(i);
+                        FD_CLR(i,&rdset);
+                    }else if(len > 0){
+                        printf("rev data : %s\n",buf);
+                        write(i,buf,strlen(buf)+1);
+                    }
+                }
+            }
+        }
+    }
+    close(lfd);
+    
+    return 0;
+}
+```
+
+#### 4.20.2 poll
+
+```c
+#include <poll.h> 
+struct pollfd { 
+    int	fd;				/* 委托内核检测的文件描述符 */
+	short events; 		/* 委托内核检测文件描述符的什么事件 */
+    short revents;		/* 文件描述符实际发生的事件 */
+};
+struct pollfd myfd; 
+myfd.fd = 5; 
+myfd.events = POLLIN | POLLOUT;
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout); 
+	- 参数： 
+        - fds : 是一个struct pollfd 结构体数组，这是一个需要检测的文件描述符的集合 
+    	- nfds : 这个是第一个参数数组中最后一个有效元素的下标 + 1 
+        - timeout : 阻塞时长 
+            0 : 不阻塞 
+            -1 : 阻塞，当检测到需要检测的文件描述符有变化，解除阻塞 
+            >0 : 阻塞的时长
+	- 返回值： 
+            -1 : 失败 
+            >0（n） : 成功,n表示检测到集合中有n个文件描述符发生变化
+```
+
+![image-20210407204834712](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407204834712.png)
+
+**server.c**
+
+```c
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <poll.h>
+
+int main(){
+
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    struct sockaddr_in saddr;
+    saddr.sin_addr.s_addr =  INADDR_ANY;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+
+    // 绑定
+    int re = bind(lfd,(struct sockaddr *)&saddr,sizeof(saddr));
+
+    // 监听
+    listen(lfd,8);
+    // 调用poll系统函数
+    struct pollfd fds[1024];
+    for(int i = 0;i < 1024;i++){
+        fds[i].fd = -1;
+        fds[i].events = POLLIN;
+    }
+    fds[0].fd = lfd;
+
+    int nfds = 0;
+    
+    while(1){
+        int ret = poll(fds,nfds + 1,-1);
+        if(ret == -1){
+            perror("poll");
+            exit(0);
+        }else if(ret == 0){
+            continue;
+        }else if(ret > 0){
+            // 说明对应文件描述符的缓冲区发生了改变。
+            if(fds[0].revents & POLLIN){
+                // 表示有新的客户端连接进来
+                struct sockaddr_in clientaddr;
+                int len = sizeof(clientaddr);
+                int cfd = accept(lfd,(struct sockaddr *)&clientaddr,&len);
+
+                // 将新的文件描述符加入到集合中
+                for(int i = 1 ;i < 1024; i++){
+                    if(fds[i].fd == -1) {
+                        fds[i].fd = cfd;
+                        fds[i].events = POLLIN;
+                        break;
+                    }
+                }
+                // 更新最大的文件描述符
+                nfds = nfds > cfd ? nfds : cfd;
+            }
+            for(int i = 1;i <= nfds; i++){
+                if(fds[i].revents & POLLIN){
+                    // 说明文件描述符对应的客户端发来了数据
+                    char buf[1024] = {0};
+                    int len = read(fds[i].fd,buf,sizeof(buf));
+                    if(len == -1){
+                        perror("read");
+                        exit(0);
+                    }else if(len == 0){
+                        printf("client closed ....\n");
+                        close(fds[i].fd);
+                        fds[i].fd = -1;
+                    }else if(len > 0){
+                        printf("rev data : %s\n",buf);
+                        write(fds[i].fd,buf,strlen(buf)+1);
+                    }
+                }
+            }
+        }
+    }
+    close(lfd);
+    
+    return 0;
+}
+```
+
+#### 4.20.3 epoll
+
+![image-20210407214918549](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210407214918549.png)
+
+```c
+#include <sys/epoll.h> 
+// 创建一个新的epoll实例。在内核中创建了一个数据，这个数据中有两个比较重要的数据，一个是需要检测的文件描述符的信息（红黑树），还有一个是就绪列表，存放检测到数据发送改变的文件描述符信息（双向链表）。 
+int epoll_create(int size); 
+- 参数： 
+    size : 目前没有意义了。随便写一个数，必须大于0
+- 返回值： 
+    -1 : 失败
+	> 0 : 文件描述符，操作epoll实例的
+typedef union epoll_data { 
+        void		*ptr;
+		int			fd;
+		uint32_t 	u32;
+        uint64_t	u64;
+} epoll_data_t;
+
+// 对epoll实例进行管理：添加文件描述符信息，删除信息，修改信息 
+int epoll_ctl(int epfd, int op, int fd, struct epoll_event *event); 
+- 参数：
+	- epfd : epoll实例对应的文件描述符 
+    - op : 要进行什么操作 
+        EPOLL_CTL_ADD: 添加 
+        EPOLL_CTL_MOD: 修改 
+        EPOLL_CTL_DEL: 删除
+	- fd : 要检测的文件描述符 
+    - event : 检测文件描述符什么事情
+        struct epoll_event {
+    		uint32_t event; 		/* Epoll events */
+    		epoll_data_t data;		/* User data variable */
+			};
+
+    typedef union epoll_data { 
+        void		*ptr;
+        int			fd;
+        uint32_t 	u32;
+        uint64_t	u64;
+    } epoll_data_t;
+// 检测函数
+int epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout); 
+- 参数： 
+    - epfd : epoll实例对应的文件描述符 
+    - events : 传出参数，保存了发生了变化的文件描述符的信息 
+    - maxevents : 第二个参数结构体数组的大小 
+    - timeout : 阻塞时间 
+        - 0 : 不阻塞 
+        - -1 : 阻塞，直到检测到fd数据发生变化，解除阻塞 
+        - > 0 : 阻塞的时长（毫秒）
+- 返回值： 
+        - 成功，返回发送变化的文件描述符的个数 > 0
+		- 失败 -1
+```
+
+**server_epoll.c**
+
+```c
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+
+int main(){
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    struct sockaddr_in saddr;
+    saddr.sin_addr.s_addr =  INADDR_ANY;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+
+    // 绑定
+    int re = bind(lfd,(struct sockaddr *)&saddr,sizeof(saddr));
+
+    // 监听
+    listen(lfd,8);
+
+    // 调用epoll_create()创建一个epoll实例
+    int epfd = epoll_create(10);
+
+    // 将监听的文件描述符的相关信息添加到epoll实例中
+    struct epoll_event epev;
+    epev.events = EPOLLIN | EPOLLOUT;
+    epev.data.fd = lfd;
+    epoll_ctl(epfd,EPOLL_CTL_ADD,lfd,&epev);
+
+    // 创建数组，用来保存内核返回的数据
+    struct epoll_event arrep[1024];
+    while(1){
+        int ret = epoll_wait(epfd,arrep,1024,-1);
+        if(ret == -1){
+            perror("epoll");
+            exit(0);
+        }else if(ret == 0){
+            continue;
+        }else if(ret > 0){
+            printf("ret = %d\n",ret);
+            for(int i = 0;i < ret;i++){
+                if(arrep[i].data.fd == lfd){
+                    // 监听的文件描述符号，有客户端连接
+                    struct sockaddr_in clientaddr;
+                    int len = sizeof(clientaddr);
+                    int cfd = accept(lfd,(struct sockaddr *)&clientaddr,&len);
+
+                    epev.events = EPOLLIN;
+                    epev.data.fd = cfd;
+
+                    epoll_ctl(epfd,EPOLL_CTL_ADD,cfd,&epev);
+                }else{
+                    if(arrep[i].events & EPOLLOUT){
+                        continue;
+                    }
+                    // 说明有数据到达
+                    char buf[1024] = {0};
+                    int len = read(arrep[i].data.fd,buf,sizeof(buf));
+                    if(len == -1){
+                        perror("read");
+                        exit(0);
+                    }else if(len == 0){
+                        printf("client closed ....\n");
+                        epoll_ctl(epfd,EPOLL_CTL_DEL,arrep[i].data.fd,NULL);
+                        close(arrep[i].data.fd);
+                        
+                    }else if(len > 0){
+                        printf("rev data : %s\n",buf);
+                        write(arrep[i].data.fd,buf,strlen(buf)+1);
+                    }
+
+                }
+            }
+
+        }
+    }
+
+    close(lfd);
+    close(epfd);
+    return 0;
+}
+```
+
+
+
+- Epoll 的工作模式：
+  
+  - LT 模式 （水平触发） 
+    
+    假设委托内核检测读事件 -> 检测fd的读缓冲区 
+    
+    ​	读缓冲区有数据 - > epoll检测到了会给用户通知 
+    
+    ​		a.用户不读数据，数据一直在缓冲区，epoll 会一直通知 
+    
+    ​		b.用户只读了一部分数据，epoll会通知
+    
+    ​		c.缓冲区的数据读完了，不通知
+    
+    > LT（level - triggered）是缺省的工作方式，并且同时支持 block 和 no-block socket。在这 种做法中，内核告诉你一个文件描述符是否就绪了，然后你可以对这个就绪的 fd 进行 IO 操作。如果你不作任何操作，内核还是会继续通知你的。
+    
+  - ET 模式（边沿触发）
+  
+    假设委托内核检测读事件 -> 检测fd的读缓冲区 
+  
+    ​	读缓冲区有数据 - > epoll检测到了会给用户通知 
+  
+    ​		a.用户不读数据，数据一致在缓冲区中，epoll下次检测的时候就不通知了 
+  
+    ​		b.用户只读了一部分数据,epoll不通知
+  
+    ​		c.缓冲区的数据读完了，不通知
+  
+    > ET（edge - triggered）是高速工作方式，只支持 no-block socket。在这种模式下，当描述符从未就绪变为就绪时，内核通过epoll告诉你。然后它会假设你知道文件描述符已经就绪，并且不会再为那个文件描述符发送更多的就绪通知，直到你做了某些操作导致那个文件描述符不再为就绪状态了。但是请注意，如果一直不对这个 fd 作 IO 操作（从而导致它再次变成 未就绪），内核不会发送更多的通知（only once）。 
+    >
+    > ET 模式在很大程度上减少了 epoll 事件被重复触发的次数，因此效率要比 LT 模式高。epoll 工作在 ET 模式的时候，必须使用非阻塞套接口，以避免由于一个文件句柄的阻塞读/阻塞写操作把处理多个文件描述符的任务饿死。
+
+```c
+struct epoll_event { 
+	uint32_t events;		/* Epoll events */
+	epoll_data_t data;		/* User data variable */
+}; 
+常见的Epoll检测事件： 
+	- EPOLLIN 
+	- EPOLLOUT 
+	- EPOLLERR 
+	- EPOLLET     //边沿触发
+```
+
+**epoll_it.c**
+
+```c
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+
+int main(){
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    struct sockaddr_in saddr;
+    saddr.sin_addr.s_addr =  INADDR_ANY;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+
+    // 绑定
+    int re = bind(lfd,(struct sockaddr *)&saddr,sizeof(saddr));
+
+    // 监听
+    listen(lfd,8);
+
+    // 调用epoll_create()创建一个epoll实例
+    int epfd = epoll_create(10);
+
+    // 将监听的文件描述符的相关信息添加到epoll实例中
+    struct epoll_event epev;
+    epev.events = EPOLLIN;
+    epev.data.fd = lfd;
+    epoll_ctl(epfd,EPOLL_CTL_ADD,lfd,&epev);
+
+    // 创建数组，用来保存内核返回的数据
+    struct epoll_event arrep[1024];
+    while(1){
+        int ret = epoll_wait(epfd,arrep,1024,-1);
+        if(ret == -1){
+            perror("epoll");
+            exit(0);
+        }else if(ret == 0){
+            continue;
+        }else if(ret > 0){
+            printf("ret = %d\n",ret);
+            for(int i = 0;i < ret;i++){
+                if(arrep[i].data.fd == lfd){
+                    // 监听的文件描述符号，有客户端连接
+                    struct sockaddr_in clientaddr;
+                    int len = sizeof(clientaddr);
+                    int cfd = accept(lfd,(struct sockaddr *)&clientaddr,&len);
+
+                    epev.events = EPOLLIN;
+                    epev.data.fd = cfd;
+
+                    epoll_ctl(epfd,EPOLL_CTL_ADD,cfd,&epev);
+                }else{
+                    // 说明有数据到达
+                    char buf[5] = {0};
+                    int len = read(arrep[i].data.fd,buf,sizeof(buf));
+                    if(len == -1){
+                        perror("read");
+                        exit(0);
+                    }else if(len == 0){
+                        printf("client closed ....\n");
+                        epoll_ctl(epfd,EPOLL_CTL_DEL,arrep[i].data.fd,NULL);
+                        close(arrep[i].data.fd);
+                        
+                    }else if(len > 0){
+                        printf("rev data : %s\n",buf);
+                        write(arrep[i].data.fd,buf,strlen(buf)+1);
+                    }
+
+                }
+            }
+
+        }
+    }
+
+    close(lfd);
+    close(epfd);
+    return 0;
+}
+```
+
+**epoll_et.c**
+
+```c
+#include <sys/select.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdio.h>
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <errno.h>
+
+int main(){
+    int lfd = socket(PF_INET,SOCK_STREAM,0);
+    struct sockaddr_in saddr;
+    saddr.sin_addr.s_addr =  INADDR_ANY;
+    saddr.sin_port = htons(9999);
+    saddr.sin_family = AF_INET;
+
+    // 绑定
+    int re = bind(lfd,(struct sockaddr *)&saddr,sizeof(saddr));
+
+    // 监听
+    listen(lfd,8);
+
+    // 调用epoll_create()创建一个epoll实例
+    int epfd = epoll_create(100);
+
+    // 将监听的文件描述符的相关信息添加到epoll实例中
+    struct epoll_event epev;
+    epev.events = EPOLLIN;
+    epev.data.fd = lfd;
+    epoll_ctl(epfd,EPOLL_CTL_ADD,lfd,&epev);
+
+    // 创建数组，用来保存内核返回的数据
+    struct epoll_event arrep[1024];
+    while(1){
+        int ret = epoll_wait(epfd,arrep,1024,-1);
+        if(ret == -1){
+            perror("epoll_wait");
+            exit(0);
+        }else if(ret == 0){
+            continue;
+        }else if(ret > 0){
+            printf("ret = %d\n",ret);
+            for(int i = 0;i < ret;i++){
+                if(arrep[i].data.fd == lfd){
+                    // 监听的文件描述符号，有客户端连接
+                    struct sockaddr_in clientaddr;
+                    int len = sizeof(clientaddr);
+                    int cfd = accept(lfd,(struct sockaddr *)&clientaddr,&len);
+                    // 设置cfd非阻塞
+                    int flag = fcntl(cfd, F_GETFL);
+                    flag = flag | O_NONBLOCK;
+                    fcntl(cfd,F_SETFL,flag);
+
+                    epev.events = EPOLLIN | EPOLLET;
+                    epev.data.fd = cfd;
+
+                    epoll_ctl(epfd,EPOLL_CTL_ADD,cfd,&epev);
+                }else{
+                    // 说明有数据到达
+                    if(arrep[i].events & EPOLLOUT){
+                        continue;
+                    }
+                    char buf[5] = {0};
+                    // 循环读取所有的数据
+                    int len = 0;
+                    // 设置read为非阻塞的情形，通过文件描述符来设置
+                    while((len = read(arrep[i].data.fd,buf,sizeof(buf)))>0){
+                        // printf("rev data : %s\n",buf);
+                        write(STDOUT_FILENO,buf,len);
+                        write(arrep[i].data.fd,buf,len);
+                    }    
+                    if(len == 0){
+                        printf("client closed ...\n");
+                    }else if(len == -1){
+                        if(errno == EAGAIN){
+                            printf("data over ...\n");
+                        }else{
+                            perror("read");
+                            exit(0);
+                        }
+                        
+                    }
+                    
+                }
+            }
+
+        }
+    }
+
+    close(lfd);
+    close(epfd);
+    return 0;
+}
+```
+
+### 4.21 UDP
+
+#### 4.21.1 通信
+
+![image-20210408125658320](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408125658320.png)
+
+```c
+#include <sys/types.h> 
+#include <sys/socket.h> 
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags, const struct 				sockaddr *dest_addr, socklen_t addrlen);
+- 参数： 
+    - sockfd : 通信的fd 
+    - buf : 要发送的数据 
+    - len : 发送数据的长度 
+    - flags : 0 
+    - dest_addr : 通信的另外一端的地址信息 
+    - addrlen : 地址的内存大小
+- 返回值：
+    成功 返回发送的字节数
+    失败 返回-1，设置错误号
+        
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags, struct sockaddr 				*src_addr, socklen_t *addrlen);
+- 参数：
+    - sockfd : 通信的fd 
+    - buf : 接收数据的数组
+    - len : 数组的大小
+    - flags : 0 
+    - src_addr : 用来保存另外一端的地址信息，不需要可以指定为NULL
+    - addrlen : 地址的内存大小
+```
+
+**UDP_server.c**
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdlib.h>
+
+int main(){
+    // 1.创建socket
+    int lfd = socket(PF_INET,SOCK_DGRAM,0);
+    if(lfd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 2.绑定
+    struct sockaddr_in addr;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(9999);
+    int re = bind(lfd,(struct sockaddr *)&addr,sizeof(addr));
+    if(re == -1){
+        perror("bind");
+        exit(0);
+    }
+
+    // 3.通信
+    while(1){
+        // 接受数据
+        char buf[128];
+        char ipbuf[16];
+        struct sockaddr_in clientaddr;
+        int len = sizeof(clientaddr);
+        int num = recvfrom(lfd,buf,sizeof(buf),0,(struct sockaddr *)&clientaddr,&len);
+        if(num == -1){
+            perror("recvfrom");
+            exit(0);
+        }
+
+        printf("client IP  :  %s , Port  ： %d \n",
+        inet_ntop(AF_INET,&clientaddr.sin_addr.s_addr,ipbuf,sizeof(ipbuf)),
+        ntohs(clientaddr.sin_port));
+
+        printf("client say : %s\n",buf);
+
+        sendto(lfd,buf,strlen(buf)+1,0,(struct sockaddr *)&clientaddr,sizeof(clientaddr));
+
+    }
+    close(lfd);
+    
+    return 0;
+}
+```
+
+**UDP_client.c**
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdlib.h>
+
+int main(){
+    // 1.创建socket
+    int lfd = socket(PF_INET,SOCK_DGRAM,0);
+    if(lfd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 2.绑定
+    struct sockaddr_in saddr;
+    inet_pton(AF_INET,"127.0.0.1",&saddr.sin_addr.s_addr);
+    saddr.sin_family = AF_INET;
+    saddr.sin_port = htons(9999);
+
+
+    // 3.通信
+    int num1 = 0;
+    while(1){
+        // 接受数据
+        char buf[128];
+        int len = sizeof(buf);
+
+        sprintf(buf,"hello I am client %d\n",num1++);
+        sendto(lfd,buf,strlen(buf)+1,0,(struct sockaddr *)&saddr,len);
+
+        int num = recvfrom(lfd,buf,sizeof(buf),0,NULL,NULL);
+        if(num == -1){
+            perror("recvfrom");
+            exit(0);
+        }
+
+        printf("server say : %s\n",buf);
+
+        sleep(1);
+    }
+    close(lfd);
+    return 0;
+}
+```
+
+#### 4.21.2 广播
+
+> 向子网中多台计算机发送消息，并且子网中所有的计算机都可以接收到发送方发送的消息，每个广播消息都包含一个特殊的IP地址，这个IP中子网内主机标志部分的二进制全部为1。 
+>
+> a.只能在局域网中使用。
+>
+> b.客户端需要绑定服务器广播使用的端口，才可以接收到广播消息。
+
+![image-20210408140250524](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408140250524.png)
+
+```c
+// 设置广播属性的函数 
+int setsockopt(int sockfd, int level, int optname,const void *optval, socklen_t optlen); 
+	- sockfd : 文件描述符 
+	- level : SOL_SOCKET 
+	- optname : SO_BROADCAST 
+	- optval : int类型的值，为1表示允许广播
+	- optlen : optval的大小
+```
+
+**bro_server.c**
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdlib.h>
+
+int main(){
+    // 1.创建socket
+    int lfd = socket(PF_INET,SOCK_DGRAM,0);
+    if(lfd == -1){
+        perror("socket");
+        exit(0);
+    }
+
+    // 2.设置广播属性
+    int op = 1;
+    setsockopt(lfd,SOL_SOCKET,SO_BROADCAST,&op,sizeof(op)); 
+
+    // 3.创建一个广播的地址
+    struct sockaddr_in cliaddr;
+    // cliaddr.sin_addr.s_addr = INADDR_ANY;
+    cliaddr.sin_family = AF_INET;
+    cliaddr.sin_port = htons(9999);
+    inet_pton(AF_INET,"192.168.190.144",&cliaddr.sin_addr.s_addr);
+
+
+    // 4.通信
+    int nummber = 0;
+    while(1){
+        // 接受数据
+        char sendBuf[128];
+        sprintf(sendBuf,"hello client : %d \n",nummber++);
+
+        sendto(lfd,sendBuf,strlen(sendBuf)+1,0,(struct sockaddr *)&cliaddr,sizeof(cliaddr));
+        printf("广播的数据 ： %s\n",sendBuf);
+
+        sleep(1);
+    }
+    close(lfd);
+    
+    return 0;
+}
+```
+
+**bro_client.c**
+
+```c
+#include <stdio.h>
+#include <unistd.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <stdlib.h>
+
+int main(){
+    // 1.创建socket
+    int lfd = socket(PF_INET,SOCK_DGRAM,0);
+    if(lfd == -1){
+        perror("socket");
+        exit(0);
+    }
+    // 2.绑定
+    struct sockaddr_in addr;
+    // inet_pton(AF_INET,"192.168.190.144",&addr.sin_addr.s_addr);
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(9999);
+    addr.sin_addr.s_addr = INADDR_ANY;// 绑定本机的IP地址
+
+    int re = bind(lfd,(struct sockaddr *)&addr,sizeof(addr));
+    if(re == -1){
+        perror("bind");
+        exit(-1);
+    }
+    // 3.通信
+    while(1){
+        // 接受数据
+        char buf[128];
+        int num = recvfrom(lfd,buf,sizeof(buf),0,NULL,NULL);
+        if(num == -1){
+            perror("recvfrom");
+            exit(0);
+        }
+
+        printf("server say : %s\n",buf);
+
+        sleep(1);
+    }
+    close(lfd);
+    return 0;
+}
+```
+
+#### 4.21.3 组播
+
+> 单播地址标识单个 IP 接口，广播地址标识某个子网的所有 IP 接口，多播地址标识一组 IP 接口。单播和广播是寻址方案的两个极端（要么单个要么全部），多播则意在两者之间提供一种折中方案。多播数据报只应该由对它感兴趣的接口接收，也就是说由运行相应多播会话应用系统的主机上的接口接收。另外，广播一般局限于局域网内使用，而多播则既可以用于局域网，也可以跨广域网 使用。 
+>
+> a.组播既可以用于局域网，也可以用于广域网
+> b.客户端需要加入多播组，才能接收到多播的数据
+
+![image-20210408144116547](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408144116547.png)
+
+组播地址
+
+> IP 多播通信必须依赖于 IP 多播地址，在 IPv4 中它的范围从 224.0.0.0 到 239.255.255.255，并被划分为局部链接多播地址、预留多播地址和管理权限多播地址三类:
+
+|          IP地址           |                             说明                             |
+| :-----------------------: | :----------------------------------------------------------: |
+|   224.0.0.0~224.0.0.255   | 局部链接多播地址：是为路由协议和其它用途保留的地址，路由 器并不转发属于此范围的IP包 |
+|   224.0.1.0~224.0.1.255   |  预留多播地址：公用组播地址，可用于Internet；使用前需要申请  |
+| 224.0.2.0~238.255.255.255 |  预留多播地址：用户可用组播地址(临时组地址)，全网范围内有效  |
+| 239.0.0.0~239.255.255.255 | 本地管理组播地址，可供组织内部使用，类似于私有 IP 地址，不 能用于 Internet，可限制多播范围 |
+
+**设置组播**
+
+```c
+int setsockopt(int sockfd, int level, int optname,const void *optval, socklen_t optlen);
+	// 服务器设置多播的信息，外出接口
+    - level : IPPROTO_IP 
+    - optname : IP_MULTICAST_IF 
+    - optval : struct in_addr
+    // 客户端加入到多播组： 
+    - level : IPPROTO_IP 
+    - optname : IP_ADD_MEMBERSHIP
+    - optval : struct ip_mreq
+    
+struct ip_mreq {
+        /* IP multicast address of group. */ 
+        struct in_addr imr_multiaddr;      //组播的IP地址
+        
+        /* Local IP address of interface. */ 
+        struct in_addr imr_interface;      //本地的IP地址
+};
+
+typedef uint32_t in_addr_t; 
+struct in_addr {
+	in_addr_t s_addr;
+};
+```
+
+### 4.22 本地套接字
+
+> 本地套接字的作用：本地的进程间通信 
+>
+> ​		有关系的进程间的通信 
+>
+> ​		没有关系的进程间的通信
+>
+> 本地套接字实现流程和网络套接字类似，一般呢采用TCP的通信流程。
+
+![image-20210408151336754](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408151336754.png)
+
+```c
+// 本地套接字通信的流程 - tcp 
+// 服务器端 
+1. 创建监听的套接字 
+	int lfd = socket(AF_UNIX/AF_LOCAL, SOCK_STREAM, 0);
+2. 监听的套接字绑定本地的套接字文件 -> server端 
+	struct sockaddr_un addr; 
+	// 绑定成功之后，指定的sun_path中的套接字文件会自动生成。 
+	bind(lfd, addr, len);
+3. 监听 
+	listen(lfd, 100);
+4. 等待并接受连接请求 
+	struct sockaddr_un cliaddr; 
+	int cfd = accept(lfd, &cliaddr, len);
+5. 通信 
+	接收数据：read/recv 
+	发送数据：write/send
+6. 关闭连接 close();
+
+
+// 客户端的流程 
+1. 创建通信的套接字 
+	int fd = socket(AF_UNIX/AF_LOCAL, SOCK_STREAM, 0);
+2. 监听的套接字绑定本地的IP端口 
+	struct sockaddr_un addr; 
+	// 绑定成功之后，指定的sun_path中的套接字文件会自动生成。 
+	bind(lfd, addr, len);
+3. 连接服务器 
+	struct sockaddr_un serveraddr; 
+	connect(fd, &serveraddr, sizeof(serveraddr));
+4. 通信 
+	接收数据：read/recv 
+	发送数据：write/send
+5. 关闭连接
+	close();
+```
+
+```c
+// 头文件: sys/un.h 
+#define UNIX_PATH_MAX 108 
+struct sockaddr_un { 
+	sa_family_t sun_family; // 地址族协议 af_local 
+	char sun_path[UNIX_PATH_MAX]; // 套接字文件的路径, 这是一个伪文件, 大小永远=0
+};
+```
+
+![image-20210408153559679](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408153559679.png)
+
+**ipc_server.c**
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
+
+int main(){
+    unlink("server.sock");
+    // 1.创建套接字
+    int lfd = socket(AF_LOCAL,SOCK_STREAM,0);
+    
+    if(lfd == -1){
+        perror("socket");
+        exit(-1);
+    }
+
+    // 2.绑定本地套接字文件
+    struct sockaddr_un addr;
+    addr.sun_family = AF_LOCAL;
+    strcpy(addr.sun_path,"server.sock");
+    int re = bind(lfd,(struct sockaddr *)&addr,sizeof(addr));
+    if(re == -1){
+        perror("bind");
+        exit(-1);
+    }
+
+    // 3.监听
+    re = listen(lfd,8);
+    if(re == -1){
+        perror("listen");
+        exit(-1);
+    }
+
+    // 4.等待客户端连接
+    struct sockaddr_un cliaddr;
+    int len = sizeof(cliaddr);
+    int cfd = accept(lfd,(struct sockaddr *)&cliaddr,&len);
+    if( cfd == -1){
+        perror("accept");
+        exit(-1);
+    }
+
+    printf("client sockt filename : %s",cliaddr.sun_path);
+
+    // 5.通信
+    while(1){
+        char buf[128];
+        int len = recv(cfd,buf,sizeof(buf),0);
+        if(len == -1){
+            perror("recv");
+            exit(-1);
+        }else if(len == 0){
+            printf("client closed ...\n");
+            break;
+        }else if(len > 0){
+            printf("client says : %s \n",buf);
+            send(cfd,buf,len,0);
+        }
+
+    }
+    close(cfd);
+    close(lfd);
+    return 0;
+}
+```
+
+**ipc_client.c**
+
+```c
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/un.h>
+#include <arpa/inet.h>
+
+int main(){
+    unlink("client.sock");
+    // 1.创建套接字
+    int cfd = socket(AF_LOCAL,SOCK_STREAM,0);
+    
+    if(cfd == -1){
+        perror("socket");
+        exit(-1);
+    }
+
+    // 2.绑定本地套接字文件
+    struct sockaddr_un addr;
+    addr.sun_family = AF_LOCAL;
+    strcpy(addr.sun_path,"client.sock");
+    int re = bind(cfd,(struct sockaddr *)&addr,sizeof(addr));
+    if(re == -1){
+        perror("bind");
+        exit(-1);
+    }
+
+    // 3.连接服务器
+    struct sockaddr_un saddr;
+    saddr.sun_family = AF_LOCAL;
+    strcpy(saddr.sun_path,"server.sock");
+    re = connect(cfd,(struct sockaddr *)&saddr,sizeof(saddr));
+    if(re == -1){
+        perror("connect");
+        exit(-1);
+    }
+
+    // 5.通信
+    int num = 0;
+    while(1){
+        char buf[128];
+        sprintf(buf,"hello I am client %d \n",num++);
+        send(cfd,buf,strlen(buf)+1,0);
+
+        printf("client says : %s \n",buf);
+
+        int len = recv(cfd,buf,sizeof(buf),0);
+        if(len == -1){
+            perror("recv");
+            exit(-1);
+        }else if(len == 0){
+            printf("server closed ...\n");
+            break;
+        }else if(len > 0){
+            printf("server says : %s \n",buf);   
+        }
+        sleep(1);
+    }
+    close(cfd);
+    return 0;
+}
+```
+
+## 5. 项目实战
+
+### 5.1 阻塞/非阻塞、 同步/异步（网络I/O）
+
+> 典型的一次IO的两个阶段是什么？数据就绪 和 数据读写
+
+数据就绪：根据系统IO操作的就绪状态
+
+- 阻塞 
+- 非阻塞
+
+数据读写：根据应用程序和内核的交互方式
+
+- 同步 
+- 异步
+
+陈硕：在处理 IO 的时候，阻塞和非阻塞都是同步 IO，只有使用了特殊的 API 才是异步 IO。
+
+<img src="https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408213706136.png" alt="image-20210408213706136" style="zoom:50%;" />
+
+![image-20210408215009519](https://raw.githubusercontent.com/wenchenwan/CloudPic/master/img/image-20210408215009519.png)
+
+> 一个典型的网络IO接口调用，分为两个阶段，分别是“数据就绪” 和 “数据读写”，数据就绪阶段分为阻塞和非阻塞，表现得结果就是，阻塞当前线程或是直接返回。
+>
+> 同步表示A向B请求调用一个网络IO接口时（或者调用某个业务逻辑API接口时），数据的读写都是由请求方A自己来完成的（不管是阻塞还是非阻塞）；异步表示A向B请求调用一个网络IO接口时（或者调用某个业务逻辑API接口时），向B传入请求的事件以及事件发生时通知的方式，A就可以处理其它逻辑了，当B监听到事件处理完成后，会用事先约定好的通知方式，通知A处理结果。
+
+- 同步阻塞 
+- 同步非阻塞 
+- 异步阻塞
+- 异步非阻塞
+
